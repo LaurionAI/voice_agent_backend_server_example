@@ -1,0 +1,19 @@
+[project]
+name = "voice-agent-backend-server"
+version = "1.0.0"
+description = "Voice Agent Backend Server with WebRTC and WebSocket support"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "python-dotenv>=1.0.0",
+    "aiortc>=1.6.0",
+    "edge-tts>=6.1.0",
+    "numpy>=1.24.0",
+    "webrtcvad>=2.0.10",
+    "langchain-openai>=0.1.0",
+    "av>=10.0.0",
+    "aiohttp>=3.9.0",
+    "gradio-client>=0.15.0",
+]
+

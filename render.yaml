@@ -1,0 +1,58 @@
+# Render.com deployment configuration
+# Native Python runtime (no Docker)
+services:
+  - type: web
+    name: voice-agent-backend-server
+    env: python
+    region: oregon
+    plan: free
+    branch: main
+    buildCommand: |
+      curl -LsSf https://astral.sh/uv/install.sh | sh
+      source $HOME/.cargo/env
+      uv sync --frozen
+      # Install FFmpeg (static build)
+      mkdir -p bin
+      curl -L https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz | tar -xj -C bin --strip-components=1
+      export PATH=$PWD/bin:$PATH
+      # Skip model download - will lazy-load on first request
+      echo "Build complete. Model will download on first use."
+    startCommand: |
+      export PATH=$PWD/bin:$PATH
+      cd backend && uv run uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1 --ws-max-size 1048576 --ws-ping-interval 20 --ws-ping-timeout 20 --timeout-keep-alive 300
+    healthCheckPath: /live
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.0
+      - key: ENVIRONMENT
+        value: production
+      - key: DEBUG
+        value: false
+      - key: HOST
+        value: 0.0.0.0
+      # PORT is automatically provided by Render
+      - key: WORKERS
+        value: 1
+      - key: ZHIPUAI_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: HF_TOKEN
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: CORS_ORIGINS
+        value: '*'  # Allow all origins in production - frontend handles auth
+      - key: MAX_WEBSOCKET_CONNECTIONS
+        value: 50
+      - key: WEBSOCKET_HEARTBEAT_INTERVAL
+        value: 30
+      - key: WEBSOCKET_TIMEOUT
+        value: 300
+      - key: CACHE_DEFAULT_TTL_SECONDS
+        value: 900
+      - key: RATE_LIMIT_REQUESTS_PER_MINUTE
+        value: 100
+      - key: LOG_LEVEL
+        value: INFO
