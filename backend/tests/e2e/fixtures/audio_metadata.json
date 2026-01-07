@@ -1,0 +1,36 @@
+{
+  "generated_at": "2025-01-04",
+  "tts_provider": "edge-tts",
+  "test_cases": [
+    {
+      "filename": "test_hello_chinese.mp3",
+      "text": "你好，今天天气怎么样？",
+      "voice": "zh-CN-XiaoxiaoNeural",
+      "description": "Chinese greeting asking about weather"
+    },
+    {
+      "filename": "test_hello_english.mp3",
+      "text": "Hello, how are you today?",
+      "voice": "en-US-AriaNeural",
+      "description": "English greeting"
+    },
+    {
+      "filename": "test_query_schedule.mp3",
+      "text": "请帮我查询明天的日程安排。",
+      "voice": "zh-CN-XiaoxiaoNeural",
+      "description": "Chinese query about schedule"
+    },
+    {
+      "filename": "test_weather_query.mp3",
+      "text": "What is the weather forecast for tomorrow?",
+      "voice": "en-US-AriaNeural",
+      "description": "English weather query"
+    },
+    {
+      "filename": "test_thank_you.mp3",
+      "text": "谢谢你的帮助。",
+      "voice": "zh-CN-XiaoxiaoNeural",
+      "description": "Chinese thank you"
+    }
+  ]
+}

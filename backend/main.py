@@ -147,7 +147,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include API routes (e.g., /api/v1/live)
 try:
     from app.api import router as api_router
 
