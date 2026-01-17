@@ -397,8 +397,26 @@ async def _process_audio_buffer_after_timeout(session_id: str):
         })
 
         # Stream TTS audio back via WebRTC
-        logger.info(f"🔊 Starting TTS streaming for session {session_id[:8]}...")
-        logger.info(f"   Response length: {len(response)} chars")
+        # Use print() to guarantee output regardless of log level
+        print(f"🔊 [AUDIO DEBUG] Starting TTS streaming for session {session_id[:8]}...")
+        print(f"🔊 [AUDIO DEBUG] Response length: {len(response)} chars")
+        print(f"🔊 [AUDIO DEBUG] Response preview: {response[:100]}...")
+
+        # Check WebRTC status before streaming
+        session_data = session_manager.session_data.get(session_id, {})
+        webrtc_enabled = session_data.get("webrtc_enabled", False)
+        print(f"🔊 [AUDIO DEBUG] WebRTC enabled: {webrtc_enabled}")
+        print(f"🔊 [AUDIO DEBUG] Session data keys: {list(session_data.keys())}")
+
+        if webrtc_manager:
+            track_exists = session_id in webrtc_manager.tracks
+            pc_exists = session_id in webrtc_manager.pcs
+            print(f"🔊 [AUDIO DEBUG] WebRTC track exists: {track_exists}")
+            print(f"🔊 [AUDIO DEBUG] WebRTC PC exists: {pc_exists}")
+            if pc_exists:
+                pc = webrtc_manager.pcs[session_id]
+                print(f"🔊 [AUDIO DEBUG] WebRTC connection state: {pc.connectionState}")
+
         streaming_handler = StreamingHandler(
             session_id=session_id,
             tts_provider=tts_provider,
@@ -406,9 +424,9 @@ async def _process_audio_buffer_after_timeout(session_id: str):
         )
         try:
             await session_manager.stream_tts_response(session_id, response, streaming_handler)
-            logger.info(f"✅ TTS streaming completed for session {session_id[:8]}...")
+            print(f"✅ [AUDIO DEBUG] TTS streaming completed for session {session_id[:8]}...")
         except Exception as tts_error:
-            logger.error(f"❌ TTS streaming failed for session {session_id[:8]}...: {tts_error}")
+            print(f"❌ [AUDIO DEBUG] TTS streaming failed: {tts_error}")
             import traceback
             traceback.print_exc()
 
@@ -469,6 +487,67 @@ async def health():
             "webrtc": webrtc_manager is not None,
             "agent": agent is not None
         }
+    }
+
+
+@app.get("/debug/audio")
+async def debug_audio():
+    """Debug endpoint to check audio pipeline status."""
+    import shutil
+    import subprocess
+
+    # Check FFmpeg
+    ffmpeg_path = shutil.which("ffmpeg")
+    ffmpeg_version = None
+    ffmpeg_error = None
+
+    if ffmpeg_path:
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-version"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            ffmpeg_version = result.stdout.split('\n')[0] if result.stdout else "unknown"
+        except Exception as e:
+            ffmpeg_error = str(e)
+
+    # Check WebRTC state
+    webrtc_info = {}
+    if webrtc_manager:
+        webrtc_info = {
+            "active_connections": len(webrtc_manager.pcs),
+            "active_tracks": len(webrtc_manager.tracks),
+            "connection_states": {
+                sid[:8]: pc.connectionState
+                for sid, pc in webrtc_manager.pcs.items()
+            }
+        }
+
+    # Check active sessions with WebRTC status
+    sessions_info = {}
+    if session_manager:
+        for sid, data in session_manager.session_data.items():
+            sessions_info[sid[:8]] = {
+                "webrtc_enabled": data.get("webrtc_enabled", False),
+                "is_active": data.get("is_active", False)
+            }
+
+    return {
+        "ffmpeg": {
+            "available": ffmpeg_path is not None,
+            "path": ffmpeg_path,
+            "version": ffmpeg_version,
+            "error": ffmpeg_error
+        },
+        "environment": {
+            "ENVIRONMENT": os.environ.get("ENVIRONMENT", "not set"),
+            "PATH": os.environ.get("PATH", "not set")[:200] + "..."  # Truncate PATH
+        },
+        "webrtc": webrtc_info,
+        "sessions": sessions_info,
+        "tts_provider": type(tts_provider).__name__ if tts_provider else None
     }
 
 @app.websocket("/ws")

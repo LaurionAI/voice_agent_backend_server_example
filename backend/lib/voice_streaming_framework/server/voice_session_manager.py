@@ -468,10 +468,14 @@ class VoiceSessionManager:
         import asyncio
         import shutil
 
+        # Use print() for guaranteed output in production
+        print(f"🎙️ [TTS->WebRTC] Starting for session {session_id[:8]}...")
+        print(f"   Text length: {len(text)} chars")
         logger.info(f"🎙️ [TTS->WebRTC] Starting for session {session_id[:8]}...")
         logger.info(f"   Text length: {len(text)} chars, preview: {text[:80]}...")
 
         if not self.webrtc_manager_factory:
+            print("❌ [TTS->WebRTC] No WebRTC manager factory configured")
             logger.error("❌ No WebRTC manager factory configured")
             return
 
@@ -479,6 +483,8 @@ class VoiceSessionManager:
 
         # Check if track exists for this session
         if session_id not in webrtc.tracks:
+            print(f"❌ [TTS->WebRTC] No WebRTC track found for session {session_id[:8]}...")
+            print(f"   Available tracks: {list(webrtc.tracks.keys())}")
             logger.error(f"❌ No WebRTC track found for session {session_id[:8]}...")
             logger.error(f"   Available tracks: {list(webrtc.tracks.keys())}")
             return
@@ -486,9 +492,12 @@ class VoiceSessionManager:
         # Check FFmpeg availability before starting
         ffmpeg_path = shutil.which("ffmpeg")
         if not ffmpeg_path:
+            print(f"❌ [TTS->WebRTC] FFmpeg not found in PATH!")
+            print(f"   PATH: {subprocess.os.environ.get('PATH', 'not set')}")
             logger.error(f"❌ FFmpeg not found in PATH! Audio output will fail.")
             logger.error(f"   PATH: {subprocess.os.environ.get('PATH', 'not set')}")
             return
+        print(f"   [TTS->WebRTC] FFmpeg path: {ffmpeg_path}")
         logger.info(f"   FFmpeg path: {ffmpeg_path}")
 
         # Start FFmpeg process for streaming conversion
@@ -504,6 +513,7 @@ class VoiceSessionManager:
         logger.info(f"   FFmpeg command: {' '.join(ffmpeg_cmd)}")
 
         try:
+            print(f"   [TTS->WebRTC] Creating FFmpeg subprocess...")
             logger.info(f"   Creating FFmpeg subprocess...")
             process = await asyncio.create_subprocess_exec(
                 *ffmpeg_cmd,
@@ -511,6 +521,7 @@ class VoiceSessionManager:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
+            print(f"   ✅ [TTS->WebRTC] FFmpeg process created (PID: {process.pid})")
             logger.info(f"   ✅ FFmpeg process created (PID: {process.pid})")
 
             # Store process for interrupt cleanup
@@ -525,10 +536,12 @@ class VoiceSessionManager:
                 nonlocal mp3_chunk_count
                 total_bytes = 0
                 try:
+                    print(f"📥 [write_input] Starting TTS stream...")
                     logger.info(f"📥 [write_input] Starting TTS stream for session {session_id[:8]}...")
 
                     async for chunk in streaming_handler.stream_tts_audio(text):
                         if self.streaming_tasks.get(session_id, False):
+                            print(f"🛑 [write_input] Interrupted")
                             logger.warning(f"🛑 [write_input] Interrupted for session {session_id[:8]}...")
                             break
 
@@ -538,12 +551,16 @@ class VoiceSessionManager:
                         total_bytes += len(chunk)
 
                         # Log first few chunks and then every 10th
+                        if mp3_chunk_count <= 3:
+                            print(f"📥 [write_input] MP3 chunk #{mp3_chunk_count}: {len(chunk)} bytes")
                         if mp3_chunk_count <= 3 or mp3_chunk_count % 10 == 0:
                             logger.info(f"📥 [write_input] MP3 chunk #{mp3_chunk_count}: {len(chunk)} bytes")
 
+                    print(f"📥 [write_input] Complete: {mp3_chunk_count} chunks, {total_bytes} bytes")
                     logger.info(f"📥 [write_input] Complete: {mp3_chunk_count} MP3 chunks, {total_bytes} bytes total")
                     process.stdin.close()
                 except Exception as e:
+                    print(f"❌ [write_input] Error: {e}")
                     logger.error(f"❌ [write_input] Error: {e}")
                     import traceback
                     traceback.print_exc()
@@ -556,15 +573,18 @@ class VoiceSessionManager:
                 try:
                     # Read in 1920-byte chunks (20ms at 48kHz, mono, 16-bit)
                     chunk_size = 1920
+                    print(f"📤 [read_output] Starting PCM stream...")
                     logger.info(f"📤 [read_output] Starting PCM stream for session {session_id[:8]}...")
 
                     while True:
                         if self.streaming_tasks.get(session_id, False):
+                            print(f"🛑 [read_output] Interrupted at chunk {pcm_chunk_count}")
                             logger.warning(f"🛑 [read_output] Interrupted at chunk {pcm_chunk_count}")
                             break
 
                         chunk = await process.stdout.read(chunk_size)
                         if not chunk:
+                            print(f"📤 [read_output] EOF after {pcm_chunk_count} chunks")
                             logger.info(f"📤 [read_output] EOF reached after {pcm_chunk_count} chunks")
                             break
 
@@ -576,19 +596,23 @@ class VoiceSessionManager:
                         except Exception as push_e:
                             push_errors += 1
                             if push_errors <= 3:
+                                print(f"❌ [read_output] Push error #{push_errors}: {push_e}")
                                 logger.error(f"❌ [read_output] Push error #{push_errors}: {push_e}")
 
                         # Log first few chunks and then every 50th
                         if pcm_chunk_count <= 3:
+                            print(f"📤 [read_output] PCM chunk #{pcm_chunk_count} -> WebRTC")
                             logger.info(f"📤 [read_output] PCM chunk #{pcm_chunk_count}: {len(chunk)} bytes -> WebRTC")
                         elif pcm_chunk_count % 50 == 0:
                             audio_duration = pcm_chunk_count * 0.02
                             logger.info(f"📤 [read_output] Progress: chunk #{pcm_chunk_count}, duration: {audio_duration:.2f}s")
 
                     total_audio_duration = pcm_chunk_count * 0.02
+                    print(f"📤 [read_output] Complete: {pcm_chunk_count} chunks, {total_audio_duration:.2f}s audio")
                     logger.info(f"📤 [read_output] Complete: {pcm_chunk_count} PCM chunks, {total_pcm_bytes} bytes")
                     logger.info(f"📊 [read_output] Audio duration: {total_audio_duration:.2f}s, push errors: {push_errors}")
                 except Exception as e:
+                    print(f"❌ [read_output] Error: {e}")
                     logger.error(f"❌ [read_output] Error: {e}")
                     import traceback
                     traceback.print_exc()
@@ -644,17 +668,21 @@ class VoiceSessionManager:
             text: Text to synthesize
             streaming_handler: Handler with stream_tts_audio method
         """
+        # Use print() for guaranteed output in production
+        print(f"🔊 [stream_tts_response] Called for session {session_id[:8]}...")
         logger.info(f"🔊 [stream_tts_response] Called for session {session_id[:8]}...")
 
         # Check if session exists
         session_data = self.session_data.get(session_id, {})
         if not session_data:
+            print(f"❌ [stream_tts_response] Session {session_id[:8]}... not found!")
             logger.error(f"❌ [stream_tts_response] Session {session_id[:8]}... not found!")
             logger.error(f"   Active sessions: {list(self.session_data.keys())[:5]}")
             return
 
         # Check if WebRTC is enabled for this session
         webrtc_enabled = session_data.get("webrtc_enabled", False)
+        print(f"   [stream_tts_response] webrtc_enabled={webrtc_enabled}")
         logger.info(f"   webrtc_enabled={webrtc_enabled}")
         logger.info(f"   Session data keys: {list(session_data.keys())}")
 
