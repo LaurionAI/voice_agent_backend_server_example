@@ -448,15 +448,64 @@ async def handle_interruption(session_id: str, data: dict):
 
 async def fetch_ice_servers(session_id: str) -> list:
     """Fetch STUN/TURN servers for WebRTC."""
-    # Use free STUN servers (no TURN for this demo)
-    return [
-        {
-            "urls": "stun:stun.l.google.com:19302"
-        },
-        {
-            "urls": "stun:stun1.l.google.com:19302"
-        }
+    ice_servers = [
+        # Google STUN servers (free, for NAT traversal discovery)
+        {"urls": "stun:stun.l.google.com:19302"},
+        {"urls": "stun:stun1.l.google.com:19302"},
     ]
+
+    # Add TURN servers for production (required when behind NAT/firewall)
+    # Option 1: Metered.ca (if configured)
+    metered_api_key = os.environ.get("METERED_API_KEY")
+    if metered_api_key:
+        # Metered.ca provides free TURN servers
+        ice_servers.extend([
+            {
+                "urls": "turn:a.relay.metered.ca:80",
+                "username": metered_api_key,
+                "credential": metered_api_key
+            },
+            {
+                "urls": "turn:a.relay.metered.ca:80?transport=tcp",
+                "username": metered_api_key,
+                "credential": metered_api_key
+            },
+            {
+                "urls": "turn:a.relay.metered.ca:443",
+                "username": metered_api_key,
+                "credential": metered_api_key
+            },
+            {
+                "urls": "turns:a.relay.metered.ca:443",
+                "username": metered_api_key,
+                "credential": metered_api_key
+            }
+        ])
+        print(f"🔧 [ICE] Using Metered.ca TURN servers for session {session_id[:8]}...")
+    else:
+        # Option 2: OpenRelay free TURN servers (community provided, no signup needed)
+        # These are free but may have limited capacity
+        ice_servers.extend([
+            {
+                "urls": "turn:openrelay.metered.ca:80",
+                "username": "openrelayproject",
+                "credential": "openrelayproject"
+            },
+            {
+                "urls": "turn:openrelay.metered.ca:443",
+                "username": "openrelayproject",
+                "credential": "openrelayproject"
+            },
+            {
+                "urls": "turn:openrelay.metered.ca:443?transport=tcp",
+                "username": "openrelayproject",
+                "credential": "openrelayproject"
+            }
+        ])
+        print(f"🔧 [ICE] Using OpenRelay free TURN servers for session {session_id[:8]}...")
+
+    print(f"🔧 [ICE] Configured {len(ice_servers)} ICE servers")
+    return ice_servers
 
 
 # ====== HTTP ENDPOINTS ======
