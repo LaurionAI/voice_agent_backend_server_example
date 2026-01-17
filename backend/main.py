@@ -96,10 +96,34 @@ def check_ffmpeg_availability():
         return False
 
 
+def _custom_exception_handler(loop, context):
+    """Custom asyncio exception handler to suppress non-critical ICE/STUN errors."""
+    exception = context.get("exception")
+
+    # Suppress aioice STUN transaction failures (401 errors from unused TURN candidates)
+    # These are expected when ICE negotiation tries multiple candidates
+    if exception:
+        exception_str = str(type(exception).__name__)
+        exception_msg = str(exception)
+
+        # Suppress aioice.stun.TransactionFailed errors (401 from TURN auth)
+        if "TransactionFailed" in exception_str or "STUN transaction failed" in exception_msg:
+            # Log at debug level instead of error
+            logger.debug(f"ICE candidate failed (non-critical): {exception}")
+            return
+
+    # For all other exceptions, use default behavior
+    loop.default_exception_handler(context)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and cleanup global resources."""
     global session_manager, webrtc_manager, tts_provider, asr_processor, agent, audio_validator
+
+    # Set custom exception handler to suppress non-critical ICE errors
+    loop = asyncio.get_event_loop()
+    loop.set_exception_handler(_custom_exception_handler)
 
     logger.info("🚀 Starting Voice Agent Demo Server...")
 
