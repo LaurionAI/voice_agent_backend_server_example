@@ -11,14 +11,31 @@ services:
       curl -LsSf https://astral.sh/uv/install.sh | sh
       source $HOME/.cargo/env
       uv sync --frozen
-      # Install FFmpeg (static build)
+      # Install FFmpeg (static build) - use GitHub releases as backup
       mkdir -p bin
-      curl -L https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz | tar -xj -C bin --strip-components=1
-      export PATH=$PWD/bin:$PATH
-      # Skip model download - will lazy-load on first request
-      echo "Build complete. Model will download on first use."
+      echo "Downloading FFmpeg..."
+      curl -L https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o ffmpeg.tar.xz || \
+        curl -L https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz -o ffmpeg.tar.xz
+      tar -xJf ffmpeg.tar.xz
+      # Find and copy ffmpeg binary to bin/
+      find . -name "ffmpeg" -type f -executable -exec cp {} bin/ffmpeg \; 2>/dev/null || true
+      find . -name "ffprobe" -type f -executable -exec cp {} bin/ffprobe \; 2>/dev/null || true
+      chmod +x bin/ffmpeg bin/ffprobe 2>/dev/null || true
+      rm -f ffmpeg.tar.xz
+      rm -rf ffmpeg-*-static ffmpeg-master-*
+      # Verify FFmpeg installation
+      echo "FFmpeg installation check:"
+      ls -la bin/
+      ./bin/ffmpeg -version || echo "WARNING: FFmpeg not working!"
+      echo "Build complete."
     startCommand: |
-      export PATH=$PWD/bin:$PATH
+      # Set FFmpeg path using absolute path from project root
+      FFMPEG_PATH="$(pwd)/bin"
+      export PATH="$FFMPEG_PATH:$PATH"
+      echo "FFmpeg path: $FFMPEG_PATH"
+      echo "Checking FFmpeg..."
+      which ffmpeg || echo "FFmpeg not in PATH!"
+      ffmpeg -version 2>&1 | head -1 || echo "FFmpeg version check failed"
       cd backend && uv run uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1 --ws-max-size 1048576 --ws-ping-interval 20 --ws-ping-timeout 20 --timeout-keep-alive 300
     healthCheckPath: /live
     autoDeploy: true

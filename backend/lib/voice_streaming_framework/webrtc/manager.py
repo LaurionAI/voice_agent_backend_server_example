@@ -86,18 +86,19 @@ class WebRTCManager:
         create answer, and set local description.
         """
         try:
+            logger.info(f"📞 [handle_offer] Processing WebRTC offer for session {session_id[:8]}...")
             pc = await self.create_peer_connection(session_id, ice_servers=ice_servers)
 
             offer = RTCSessionDescription(sdp=sdp, type=type)
-            logger.info(f"📝 Setting remote description (offer) for {session_id}")
+            logger.info(f"📝 [handle_offer] Setting remote description (offer)")
             logger.debug(f"   Offer SDP (first 300 chars): {sdp[:300]}")
             await pc.setRemoteDescription(offer)
 
-            logger.info(f"📝 Creating answer for {session_id}")
+            logger.info(f"📝 [handle_offer] Creating answer")
             answer = await pc.createAnswer()
             await pc.setLocalDescription(answer)
 
-            logger.info(f"✅ Answer created and set as local description")
+            logger.info(f"✅ [handle_offer] Answer created and set as local description")
             logger.debug(f"   Answer SDP (first 300 chars): {pc.localDescription.sdp[:300]}")
 
             # Log transceivers to see what was negotiated
@@ -109,13 +110,20 @@ class WebRTCManager:
 
             # Signal that track is established and ready for audio streaming
             self.on_track_established(session_id)
+            logger.info(f"✅ [handle_offer] Track established, ready for audio streaming")
+
+            # Verify track is in our map
+            if session_id in self.tracks:
+                logger.info(f"   Track verified in tracks map: {self.tracks[session_id].id}")
+            else:
+                logger.error(f"❌ [handle_offer] Track NOT in tracks map after creation!")
 
             return {
                 "sdp": pc.localDescription.sdp,
                 "type": pc.localDescription.type
             }
         except Exception as e:
-            logger.error(f"❌ Error handling WebRTC offer for {session_id}: {e}")
+            logger.error(f"❌ [handle_offer] Error for session {session_id[:8]}...: {e}")
             import traceback
             traceback.print_exc()
             return None
@@ -248,12 +256,14 @@ class WebRTCManager:
     async def push_audio_chunk(self, session_id: str, pcm_data: bytes):
         """Push audio data to the track for the given session."""
         if session_id in self.tracks:
-            await self.tracks[session_id].add_frame(pcm_data)
+            track = self.tracks[session_id]
+            await track.add_frame(pcm_data)
         else:
-            # This might happen if WebRTC negotiation hasn't finished yet 
-            # but we started generating audio. 
-            # Ideally, we should handle this race condition.
-            logger.warning(f"No audio track found for session {session_id}, dropping audio chunk")
+            # This might happen if WebRTC negotiation hasn't finished yet
+            # but we started generating audio.
+            logger.warning(f"[push_audio_chunk] No track for session {session_id[:8]}...")
+            logger.warning(f"   Available tracks: {list(self.tracks.keys())[:5]}")
+            logger.warning(f"   Dropping {len(pcm_data)} bytes of audio")
 
     async def replace_audio_track(self, session_id: str):
         """

@@ -44,13 +44,14 @@ class EdgeTTSProvider(TTSProvider):
             RuntimeError: If TTS generation fails
         """
         if not text or not text.strip():
-            logger.warning("Empty text provided to TTS, skipping")
+            logger.warning("[Edge-TTS] Empty text provided, skipping")
             return
 
         try:
-            logger.debug(
-                f"🔊 Starting Edge-TTS for text (length: {len(text)}): {text[:50]}..."
+            logger.info(
+                f"🔊 [Edge-TTS] Starting synthesis for text (length: {len(text)}): {text[:80]}..."
             )
+            logger.info(f"   Voice: {self.config.voice}, Rate: {self.config.rate}")
 
             # Create communicate object
             communicate = edge_tts.Communicate(
@@ -61,11 +62,20 @@ class EdgeTTSProvider(TTSProvider):
 
             buffer = bytearray()
             chunk_count = 0
+            total_bytes = 0
+            audio_events = 0
 
             # Stream MP3 chunks from Edge-TTS
+            logger.info(f"🔊 [Edge-TTS] Starting stream...")
             async for chunk in communicate.stream():
                 if chunk["type"] == "audio":
+                    audio_events += 1
                     buffer.extend(chunk["data"])
+                    total_bytes += len(chunk["data"])
+
+                    # Log first few audio events
+                    if audio_events <= 3:
+                        logger.info(f"   Audio event #{audio_events}: {len(chunk['data'])} bytes")
 
                     # Yield chunks of specified size
                     while len(buffer) >= self.config.chunk_size:
@@ -78,7 +88,7 @@ class EdgeTTSProvider(TTSProvider):
                 yield bytes(buffer)
                 chunk_count += 1
 
-            logger.info(f"✅ Edge-TTS completed: {chunk_count} MP3 chunks generated")
+            logger.info(f"✅ [Edge-TTS] Complete: {chunk_count} chunks, {total_bytes} bytes, {audio_events} audio events")
 
         except Exception as e:
             error_msg = str(e)
