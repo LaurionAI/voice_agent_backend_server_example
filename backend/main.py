@@ -32,6 +32,8 @@ try:
 except ImportError:
     print("⚠️  python-dotenv not installed")
 
+from datetime import time
+
 from lib.voice_streaming_framework.server.voice_session_manager import VoiceSessionManager
 from lib.voice_streaming_framework.webrtc.manager import WebRTCManager
 from lib.voice_streaming_framework.tts.factory import get_tts_provider
@@ -40,6 +42,7 @@ from lib.voice_streaming_framework.audio.validator import AudioValidator
 from app.voice_agent.hf_asr import HFSpaceASR
 from app.voice_agent.simple_agent import SimpleAgent
 from app.voice_agent.streaming_handler import StreamingHandler
+from scheduler.daily_asr_scheduler import DailyASRScheduler
 
 # Configure logging
 logging.basicConfig(
@@ -55,6 +58,8 @@ tts_provider = None
 asr_processor = None
 agent: SimpleAgent = None
 audio_validator: AudioValidator = None
+asr_scheduler: DailyASRScheduler = None
+asr_scheduler_task: asyncio.Task = None
 
 # Audio buffering state
 # Maps session_id -> {"chunks": [bytes], "last_chunk_time": float}
@@ -63,12 +68,50 @@ BUFFER_TIMEOUT = 1.5  # seconds to wait before processing buffer
 MIN_CHUNKS = 1  # Process immediately (frontend sends complete segments via VAD)
 
 
+def check_ffmpeg_availability():
+    """Check if FFmpeg is available in PATH and log diagnostic info."""
+    import subprocess
+    import shutil
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path:
+        logger.info(f"✅ FFmpeg found at: {ffmpeg_path}")
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-version"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            version_line = result.stdout.split('\n')[0] if result.stdout else "unknown"
+            logger.info(f"   FFmpeg version: {version_line}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ FFmpeg version check failed: {e}")
+            return False
+    else:
+        logger.error("❌ FFmpeg NOT found in PATH!")
+        logger.error(f"   Current PATH: {os.environ.get('PATH', 'not set')}")
+        logger.error("   This will cause audio output to fail silently!")
+        return False
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and cleanup global resources."""
     global session_manager, webrtc_manager, tts_provider, asr_processor, agent, audio_validator
 
     logger.info("🚀 Starting Voice Agent Demo Server...")
+
+    # Log environment info for debugging
+    logger.info(f"📍 Environment: {os.environ.get('ENVIRONMENT', 'development')}")
+    logger.info(f"📍 Python: {os.sys.version}")
+    logger.info(f"📍 Working directory: {os.getcwd()}")
+
+    # Check FFmpeg availability (critical for audio output)
+    ffmpeg_ok = check_ffmpeg_availability()
+    if not ffmpeg_ok:
+        logger.warning("⚠️  Audio output may not work without FFmpeg!")
 
     # Initialize TTS provider (Edge TTS - free, no API key needed)
     tts_config = TTSConfig(
@@ -118,12 +161,37 @@ async def lifespan(app: FastAPI):
     session_manager.on_ice_servers_fetch = fetch_ice_servers
 
     logger.info("✅ Session manager initialized")
+
+    # Initialize daily ASR scheduler to keep HF Space alive
+    voice_sample_path = Path(__file__).parent / "scheduler" / "voice_sample" / "test_analysis_aapl_deeper.wav"
+    if voice_sample_path.exists():
+        asr_scheduler = DailyASRScheduler(
+            audio_path=str(voice_sample_path),
+            run_time=time(hour=9, minute=0)  # Run daily at 9:00 AM
+        )
+        asr_scheduler_task = asyncio.create_task(asr_scheduler.start())
+        logger.info("✅ Daily ASR scheduler started (keeps HF Space alive)")
+    else:
+        logger.warning(f"⚠️  Voice sample not found at {voice_sample_path}, scheduler not started")
+
     logger.info("🎉 Server ready! Connect on ws://localhost:8000/ws")
 
     yield
 
     # Cleanup
     logger.info("🛑 Shutting down server...")
+
+    # Stop ASR scheduler
+    if asr_scheduler:
+        asr_scheduler.stop()
+    if asr_scheduler_task and not asr_scheduler_task.done():
+        asr_scheduler_task.cancel()
+        try:
+            await asr_scheduler_task
+        except asyncio.CancelledError:
+            pass
+    logger.info("✅ ASR scheduler stopped")
+
     if webrtc_manager:
         # Close all WebRTC connections
         for session_id in list(webrtc_manager.pcs.keys()):
@@ -329,12 +397,20 @@ async def _process_audio_buffer_after_timeout(session_id: str):
         })
 
         # Stream TTS audio back via WebRTC
+        logger.info(f"🔊 Starting TTS streaming for session {session_id[:8]}...")
+        logger.info(f"   Response length: {len(response)} chars")
         streaming_handler = StreamingHandler(
             session_id=session_id,
             tts_provider=tts_provider,
             agent=agent
         )
-        await session_manager.stream_tts_response(session_id, response, streaming_handler)
+        try:
+            await session_manager.stream_tts_response(session_id, response, streaming_handler)
+            logger.info(f"✅ TTS streaming completed for session {session_id[:8]}...")
+        except Exception as tts_error:
+            logger.error(f"❌ TTS streaming failed for session {session_id[:8]}...: {tts_error}")
+            import traceback
+            traceback.print_exc()
 
     except asyncio.CancelledError:
         # Task was cancelled because a new chunk arrived
