@@ -194,6 +194,10 @@ async def lifespan(app: FastAPI):
     global webrtc_manager, sentence_aggregator, audio_converter
     global asr_scheduler, asr_scheduler_task
 
+    # Initialize scheduler variables to None to avoid UnboundLocalError
+    asr_scheduler = None
+    asr_scheduler_task = None
+
     # Set custom exception handler
     loop = asyncio.get_event_loop()
     loop.set_exception_handler(_custom_exception_handler)
@@ -707,6 +711,12 @@ async def health():
             "ffmpeg": audio_converter.is_available() if audio_converter else False,
         }
     }
+
+
+@app.get("/live")
+async def live():
+    """Health check endpoint for Render deployment."""
+    return {"status": "alive"}
 
 
 @app.get("/debug/audio")
