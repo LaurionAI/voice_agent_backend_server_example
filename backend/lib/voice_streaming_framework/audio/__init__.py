@@ -13,6 +13,8 @@ from .chunk_tracker import (
     get_tracker_manager,
     ChunkDeliveryMetrics
 )
+from .converter import AudioConverter, ConverterConfig, get_converter
+from .validator import AudioValidator
 
 __all__ = [
     "StreamingPipeline",
@@ -23,5 +25,9 @@ __all__ = [
     "ChunkTracker",
     "ChunkTrackerManager",
     "get_tracker_manager",
-    "ChunkDeliveryMetrics"
+    "ChunkDeliveryMetrics",
+    "AudioConverter",
+    "ConverterConfig",
+    "get_converter",
+    "AudioValidator",
 ]

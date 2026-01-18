@@ -4,10 +4,12 @@ import logging
 from typing import Optional, Dict, Any
 from pathlib import Path
 
+from .base import BaseASRProvider, ASRConfig
+
 logger = logging.getLogger(__name__)
 
 
-class WhisperASR:
+class WhisperASR(BaseASRProvider):
     """
     OpenAI Whisper ASR client for transcription.
 
@@ -21,6 +23,7 @@ class WhisperASR:
         api_key: Optional[str] = None,
         model: str = "whisper-1",
         language: Optional[str] = None,
+        config: Optional[ASRConfig] = None,
     ):
         """
         Initialize Whisper ASR client.
@@ -29,10 +32,12 @@ class WhisperASR:
             api_key: OpenAI API key (if None, reads from OPENAI_API_KEY env var)
             model: Whisper model to use (default: "whisper-1")
             language: Language code for transcription (default: auto-detect)
+            config: Optional ASR configuration
         """
+        super().__init__(config)
         self.api_key = api_key
         self.model = model
-        self.language = language
+        self.language = language or (config.language if config else None)
         self._client: Optional[Any] = None
 
         logger.info(f"WhisperASR initialized with model: {model}")
@@ -157,6 +162,30 @@ class WhisperASR:
         except Exception as e:
             logger.error(f"Whisper transcription failed: {e}")
             raise
+
+    async def transcribe(self, audio_bytes: bytes) -> str:
+        """
+        Transcribe audio bytes to text (implements BaseASRProvider interface).
+
+        Args:
+            audio_bytes: Raw audio data
+
+        Returns:
+            Transcribed text string
+        """
+        return await self.transcribe_audio_bytes(audio_bytes)
+
+    async def transcribe_file(self, audio_path: str) -> str:
+        """
+        Transcribe audio from file path (implements BaseASRProvider interface).
+
+        Args:
+            audio_path: Path to audio file
+
+        Returns:
+            Transcribed text string
+        """
+        return await self.transcribe_audio(audio_path)
 
     async def is_available(self) -> bool:
         """
