@@ -11,10 +11,10 @@ Benefits:
 - Consistent performance
 
 Usage:
-    from backend.app.websocket.asr.hf_space import HFSpaceASR
+    from voice_streaming_framework.asr import HFSpaceASR
 
     asr = HFSpaceASR()
-    transcription = await asr.transcribe_audio("audio.wav")
+    transcription = await asr.transcribe(audio_bytes)
 """
 
 import asyncio
@@ -23,20 +23,25 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+from .base import BaseASRProvider, ASRConfig
+
 try:
     from gradio_client import Client, handle_file
     GRADIO_CLIENT_AVAILABLE = True
 except ImportError:
     GRADIO_CLIENT_AVAILABLE = False
+    Client = None  # Type stub for when not available
+    handle_file = None
 
 
-class HFSpaceASR:
-    """HuggingFace Space ASR client."""
+class HFSpaceASR(BaseASRProvider):
+    """HuggingFace Space ASR client using SenseVoice model."""
 
     def __init__(
         self,
         space_name: str = "hz6666/SenseVoiceSmall",
-        hf_token: Optional[str] = None
+        hf_token: Optional[str] = None,
+        config: Optional[ASRConfig] = None,
     ):
         """
         Initialize HF Space ASR client.
@@ -44,7 +49,9 @@ class HFSpaceASR:
         Args:
             space_name: HuggingFace Space name (user/space)
             hf_token: Optional HuggingFace token for private spaces
+            config: Optional ASR configuration
         """
+        super().__init__(config)
         self.space_name = space_name
         self.hf_token = hf_token or os.getenv("HF_TOKEN")
         self._client = None
@@ -56,7 +63,7 @@ class HFSpaceASR:
                 "Install with: uv pip install gradio_client"
             )
 
-    def _get_client(self) -> Client:
+    def _get_client(self):
         """Get or create Gradio client."""
         if self._client is None:
             self._client = Client(
@@ -118,6 +125,30 @@ class HFSpaceASR:
             print(f"❌ HF Space ASR error: {e}")
             raise
 
+    async def transcribe(self, audio_bytes: bytes) -> str:
+        """
+        Transcribe audio bytes to text (implements BaseASRProvider interface).
+
+        Args:
+            audio_bytes: Raw audio data
+
+        Returns:
+            Transcribed text string
+        """
+        return await self.transcribe_audio_bytes(audio_bytes)
+
+    async def transcribe_file(self, audio_path: str) -> str:
+        """
+        Transcribe audio from file path (implements BaseASRProvider interface).
+
+        Args:
+            audio_path: Path to audio file
+
+        Returns:
+            Transcribed text string
+        """
+        return await self.transcribe_audio(audio_path)
+
     async def transcribe_audio_bytes(
         self,
         audio_bytes: bytes,
@@ -154,8 +185,8 @@ class HFSpaceASR:
             except Exception:
                 pass
 
-    def is_available(self) -> bool:
-        """Check if HF Space ASR is available."""
+    async def is_available(self) -> bool:
+        """Check if HF Space ASR is available (implements BaseASRProvider interface)."""
         try:
             client = self._get_client()
             return client is not None

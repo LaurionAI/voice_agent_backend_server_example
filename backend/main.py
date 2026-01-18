@@ -1,20 +1,27 @@
 """
-Minimal Voice Agent Demo Server
+Voice Agent Demo Server (v2 - Using StreamingVoicePipeline)
 
-A lightweight demonstration of the voice streaming framework with:
+A voice streaming agent using the new pipeline architecture:
+- Streaming LLM → TTS for low-latency responses
+- SentenceAggregator for real-time text chunking
 - WebSocket + WebRTC voice streaming
-- Simple agent with conversation state/memory
-- No database, no cache - pure in-memory state
-- Single agent node for processing queries
+- Interruption handling
 
 Usage:
     uvicorn main:app --host 0.0.0.0 --port 8000
 """
 
 import asyncio
+import base64
+import json
 import logging
 import os
+import time
+import uuid
 from pathlib import Path
+from datetime import time as dt_time
+from typing import Dict, Any, Optional
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -32,16 +39,21 @@ try:
 except ImportError:
     print("⚠️  python-dotenv not installed")
 
-from datetime import time
-
-from lib.voice_streaming_framework.server.voice_session_manager import VoiceSessionManager
+# Import new pipeline components
+from lib.voice_streaming_framework import (
+    OpenAICompatibleLLM,
+    LLMConfig,
+    SentenceAggregator,
+    AggregatorConfig,
+    AudioConverter,
+    get_converter,
+)
+from lib.voice_streaming_framework.asr import HFSpaceASR
+from lib.voice_streaming_framework.tts import get_tts_provider, TTSConfig
+from lib.voice_streaming_framework.audio import AudioValidator
 from lib.voice_streaming_framework.webrtc.manager import WebRTCManager
-from lib.voice_streaming_framework.tts.factory import get_tts_provider
-from lib.voice_streaming_framework.tts.base import TTSConfig
-from lib.voice_streaming_framework.audio.validator import AudioValidator
-from app.voice_agent.hf_asr import HFSpaceASR
-from app.voice_agent.simple_agent import SimpleAgent
-from app.voice_agent.streaming_handler import StreamingHandler
+
+# Scheduler for keeping HF Space alive
 from scheduler.daily_asr_scheduler import DailyASRScheduler
 
 # Configure logging
@@ -51,27 +63,49 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global instances
-session_manager: VoiceSessionManager = None
-webrtc_manager: WebRTCManager = None
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+SYSTEM_PROMPT = """你是一个有帮助的语音助手。保持回复简洁自然，适合语音输出。
+用户用什么语言提问，你就用什么语言回答。"""
+
+# Audio settings
+BUFFER_TIMEOUT = 1.5  # seconds to wait before processing audio buffer
+MIN_AUDIO_ENERGY = 500.0
+MIN_SPEECH_RATIO = 0.03
+
+# ============================================================================
+# GLOBAL STATE
+# ============================================================================
+
+# Core components
+llm_provider: OpenAICompatibleLLM = None
+asr_provider: HFSpaceASR = None
 tts_provider = None
-asr_processor = None
-agent: SimpleAgent = None
 audio_validator: AudioValidator = None
+webrtc_manager: WebRTCManager = None
+sentence_aggregator: SentenceAggregator = None
+audio_converter: AudioConverter = None
+
+# Session state
+sessions: Dict[str, Dict[str, Any]] = {}  # session_id -> session data
+audio_buffers: Dict[str, Dict] = {}  # session_id -> audio buffer
+active_tasks: Dict[str, asyncio.Task] = {}  # session_id -> processing task
+
+# Scheduler
 asr_scheduler: DailyASRScheduler = None
 asr_scheduler_task: asyncio.Task = None
 
-# Audio buffering state
-# Maps session_id -> {"chunks": [bytes], "last_chunk_time": float}
-audio_buffers: dict = {}
-BUFFER_TIMEOUT = 1.5  # seconds to wait before processing buffer
-MIN_CHUNKS = 1  # Process immediately (frontend sends complete segments via VAD)
 
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
 
 def check_ffmpeg_availability():
-    """Check if FFmpeg is available in PATH and log diagnostic info."""
-    import subprocess
+    """Check if FFmpeg is available in PATH."""
     import shutil
+    import subprocess
 
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path:
@@ -91,383 +125,19 @@ def check_ffmpeg_availability():
             return False
     else:
         logger.error("❌ FFmpeg NOT found in PATH!")
-        logger.error(f"   Current PATH: {os.environ.get('PATH', 'not set')}")
-        logger.error("   This will cause audio output to fail silently!")
         return False
 
 
 def _custom_exception_handler(loop, context):
-    """Custom asyncio exception handler to suppress non-critical ICE/STUN errors."""
+    """Suppress non-critical ICE/STUN errors."""
     exception = context.get("exception")
-
-    # Suppress aioice STUN transaction failures (401 errors from unused TURN candidates)
-    # These are expected when ICE negotiation tries multiple candidates
     if exception:
         exception_str = str(type(exception).__name__)
         exception_msg = str(exception)
-
-        # Suppress aioice.stun.TransactionFailed errors (401 from TURN auth)
         if "TransactionFailed" in exception_str or "STUN transaction failed" in exception_msg:
-            # Log at debug level instead of error
             logger.debug(f"ICE candidate failed (non-critical): {exception}")
             return
-
-    # For all other exceptions, use default behavior
     loop.default_exception_handler(context)
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Initialize and cleanup global resources."""
-    global session_manager, webrtc_manager, tts_provider, asr_processor, agent, audio_validator
-
-    # Set custom exception handler to suppress non-critical ICE errors
-    loop = asyncio.get_event_loop()
-    loop.set_exception_handler(_custom_exception_handler)
-
-    logger.info("🚀 Starting Voice Agent Demo Server...")
-
-    # Log environment info for debugging
-    logger.info(f"📍 Environment: {os.environ.get('ENVIRONMENT', 'development')}")
-    logger.info(f"📍 Python: {os.sys.version}")
-    logger.info(f"📍 Working directory: {os.getcwd()}")
-
-    # Check FFmpeg availability (critical for audio output)
-    ffmpeg_ok = check_ffmpeg_availability()
-    if not ffmpeg_ok:
-        logger.warning("⚠️  Audio output may not work without FFmpeg!")
-
-    # Initialize TTS provider (Edge TTS - free, no API key needed)
-    tts_config = TTSConfig(
-        voice="zh-CN-XiaoxiaoNeural",  # Chinese female voice
-        rate="+0%"
-    )
-    tts_provider = get_tts_provider("edge-tts", tts_config)
-    logger.info("✅ TTS provider initialized (Edge TTS)")
-
-    # Initialize ASR processor (HuggingFace Space - SenseVoiceSmall)
-    asr_processor = HFSpaceASR(space_name="hz6666/SenseVoiceSmall")
-    logger.info("✅ ASR processor initialized (HF Space - SenseVoiceSmall)")
-
-    # Initialize audio validator with WebRTC VAD
-    audio_validator = AudioValidator(
-        energy_threshold=500.0,
-        vad_mode=3,  # Most aggressive
-        enable_webrtc_vad=True,
-        speech_ratio_threshold=0.03  # 3% speech required
-    )
-    logger.info("✅ Audio validator initialized (WebRTC VAD mode=3)")
-
-    # Initialize WebRTC manager
-    webrtc_manager = WebRTCManager()
-    logger.info("✅ WebRTC manager initialized")
-
-    # Initialize simple agent with conversation memory (GLM-4.5-air)
-    agent = SimpleAgent(model="glm-4.5-air", temperature=0.7)
-    logger.info("✅ Simple agent initialized (GLM-4.5-air)")
-
-    # Initialize session manager with callbacks
-    session_manager = VoiceSessionManager(
-        streaming_handler_factory=lambda session_id: StreamingHandler(
-            session_id=session_id,
-            tts_provider=tts_provider,
-            agent=agent
-        ),
-        webrtc_manager_factory=lambda: webrtc_manager
-    )
-
-    # Set up callbacks for session events
-    session_manager.on_session_start = handle_session_start
-    session_manager.on_session_end = handle_session_end
-    session_manager.on_message_received = handle_message_received
-    session_manager.on_audio_received = handle_audio_received
-    session_manager.on_interruption = handle_interruption
-    session_manager.on_ice_servers_fetch = fetch_ice_servers
-
-    logger.info("✅ Session manager initialized")
-
-    # Initialize daily ASR scheduler to keep HF Space alive
-    voice_sample_path = Path(__file__).parent / "scheduler" / "voice_sample" / "test_analysis_aapl_deeper.wav"
-    if voice_sample_path.exists():
-        asr_scheduler = DailyASRScheduler(
-            audio_path=str(voice_sample_path),
-            run_time=time(hour=9, minute=0)  # Run daily at 9:00 AM
-        )
-        asr_scheduler_task = asyncio.create_task(asr_scheduler.start())
-        logger.info("✅ Daily ASR scheduler started (keeps HF Space alive)")
-    else:
-        logger.warning(f"⚠️  Voice sample not found at {voice_sample_path}, scheduler not started")
-
-    logger.info("🎉 Server ready! Connect on ws://localhost:8000/ws")
-
-    yield
-
-    # Cleanup
-    logger.info("🛑 Shutting down server...")
-
-    # Stop ASR scheduler
-    if asr_scheduler:
-        asr_scheduler.stop()
-    if asr_scheduler_task and not asr_scheduler_task.done():
-        asr_scheduler_task.cancel()
-        try:
-            await asr_scheduler_task
-        except asyncio.CancelledError:
-            pass
-    logger.info("✅ ASR scheduler stopped")
-
-    if webrtc_manager:
-        # Close all WebRTC connections
-        for session_id in list(webrtc_manager.pcs.keys()):
-            await webrtc_manager.close_peer_connection(session_id)
-    logger.info("✅ Server shutdown complete")
-
-
-app = FastAPI(
-    title="Voice Agent Demo",
-    description="Minimal voice streaming agent with WebRTC",
-    version="1.0.0",
-    lifespan=lifespan
-)
-
-# Enable CORS for frontend connections
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # In production, specify exact origins
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-try:
-    from app.api import router as api_router
-
-    app.include_router(api_router)
-except ImportError:
-    # In case API module is not present, continue without it.
-    logger.warning("app.api module not found; API routes not included.")
-
-
-# ====== EVENT HANDLERS ======
-
-async def handle_session_start(session_id: str, user_id: str, metadata: dict):
-    """Called when a new session starts."""
-    logger.info(f"📞 Session started: {session_id[:8]}... (user: {user_id[:8]}...)")
-
-    # Initialize conversation state for this session
-    agent.create_session(session_id)
-
-
-async def handle_session_end(session_id: str, user_id: str):
-    """Called when a session ends."""
-    logger.info(f"👋 Session ended: {session_id[:8]}...")
-
-    # Clean up conversation state
-    agent.cleanup_session(session_id)
-
-    # Clean up audio buffer
-    if session_id in audio_buffers:
-        buffer = audio_buffers[session_id]
-        # Cancel any pending processing task
-        if buffer.get("processing_task") and not buffer["processing_task"].done():
-            buffer["processing_task"].cancel()
-        del audio_buffers[session_id]
-        logger.info(f"🗑️  Cleaned up audio buffer for {session_id[:8]}...")
-
-
-async def handle_message_received(session_id: str, event: str, data: dict):
-    """Route incoming WebSocket messages."""
-    if event == "interrupt":
-        await session_manager.handle_interrupt(session_id, data)
-    elif event == "webrtc_offer":
-        await session_manager.handle_webrtc_offer(session_id, data)
-    elif event == "webrtc_ice_candidate":
-        await session_manager.handle_webrtc_ice_candidate(session_id, data)
-    elif event == "audio_chunk":
-        await handle_audio_received(session_id, data)
-    elif event == "heartbeat":
-        logger.debug(f"💓 Heartbeat from {session_id[:8]}...")
-    else:
-        logger.warning(f"⚠️ Unknown event: {event}")
-
-
-async def handle_audio_received(session_id: str, data: dict):
-    """Process incoming audio from user with buffering."""
-    import base64
-    import time
-
-    try:
-        # Extract audio data
-        audio_data = data.get("audio")
-        if not audio_data:
-            logger.warning(f"No audio data in message from {session_id[:8]}...")
-            return
-
-        audio_bytes = base64.b64decode(audio_data)
-
-        # Initialize buffer for this session if needed
-        if session_id not in audio_buffers:
-            audio_buffers[session_id] = {
-                "chunks": [],
-                "last_chunk_time": time.time(),
-                "processing_task": None
-            }
-
-        buffer = audio_buffers[session_id]
-
-        # Add chunk to buffer
-        buffer["chunks"].append(audio_bytes)
-        buffer["last_chunk_time"] = time.time()
-
-        logger.info(f"🎤 Buffered audio chunk ({len(audio_bytes)} bytes), total chunks: {len(buffer['chunks'])}")
-
-        # Cancel any existing processing task
-        if buffer["processing_task"] and not buffer["processing_task"].done():
-            buffer["processing_task"].cancel()
-
-        # Schedule processing after timeout
-        buffer["processing_task"] = asyncio.create_task(
-            _process_audio_buffer_after_timeout(session_id)
-        )
-
-    except Exception as e:
-        logger.error(f"❌ Error buffering audio: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-async def _process_audio_buffer_after_timeout(session_id: str):
-    """Process accumulated audio chunks after timeout."""
-    try:
-        # Wait for timeout
-        await asyncio.sleep(BUFFER_TIMEOUT)
-
-        # Get buffer
-        if session_id not in audio_buffers:
-            return
-
-        buffer = audio_buffers[session_id]
-        chunks = buffer["chunks"]
-
-        # Check if we have enough chunks
-        if len(chunks) < MIN_CHUNKS:
-            logger.info(f"🔇 Not enough chunks ({len(chunks)} < {MIN_CHUNKS}), skipping")
-            buffer["chunks"] = []
-            return
-
-        logger.info(f"🎙️  Processing {len(chunks)} audio chunks...")
-
-        # Combine all chunks into single audio buffer
-        combined_audio = b''.join(chunks)
-
-        # Clear buffer for next round
-        buffer["chunks"] = []
-
-        # Validate audio before ASR
-        is_valid, validation_info = audio_validator.validate_audio(
-            combined_audio,
-            sample_rate=16000,  # WebM audio is 16kHz
-            format="webm"
-        )
-
-        energy = validation_info.get("energy", 0.0)
-        speech_ratio = validation_info.get("speech_ratio", 0.0)
-
-        if not is_valid:
-            reason = validation_info.get("reason", "unknown")
-            logger.info(f"🔇 Audio validation failed: {reason} (energy={energy:.1f}, speech_ratio={speech_ratio:.2f})")
-            return
-
-        logger.info(f"✅ Audio validated: energy={energy:.1f}, speech_ratio={speech_ratio:.2f}")
-        logger.info(f"🎤 Transcribing combined audio ({len(combined_audio)} bytes)...")
-        transcript = await asr_processor.transcribe(combined_audio)
-
-        if not transcript or len(transcript.strip()) < 2:
-            logger.info(f"🔇 Empty/short transcript, ignoring")
-            # Send explicit event so frontend knows to continue listening
-            await session_manager.send_message(session_id, {
-                "event": "no_speech_detected",
-                "data": {
-                    "message": "No speech detected in audio",
-                    "session_id": session_id
-                }
-            })
-            return
-
-        logger.info(f"📝 Transcript: {transcript}")
-
-        # Send transcript to frontend
-        await session_manager.send_message(session_id, {
-            "event": "transcript",
-            "data": {
-                "text": transcript,
-                "session_id": session_id
-            }
-        })
-
-        # Process query with agent
-        logger.info(f"🤖 Processing query with agent...")
-        response = await agent.process_query(session_id, transcript)
-
-        logger.info(f"💬 Agent response: {response[:100]}...")
-
-        # Send text response
-        await session_manager.send_message(session_id, {
-            "event": "agent_response",
-            "data": {
-                "text": response,
-                "session_id": session_id
-            }
-        })
-
-        # Stream TTS audio back via WebRTC
-        # Use print() to guarantee output regardless of log level
-        print(f"🔊 [AUDIO DEBUG] Starting TTS streaming for session {session_id[:8]}...")
-        print(f"🔊 [AUDIO DEBUG] Response length: {len(response)} chars")
-        print(f"🔊 [AUDIO DEBUG] Response preview: {response[:100]}...")
-
-        # Check WebRTC status before streaming
-        session_data = session_manager.session_data.get(session_id, {})
-        webrtc_enabled = session_data.get("webrtc_enabled", False)
-        print(f"🔊 [AUDIO DEBUG] WebRTC enabled: {webrtc_enabled}")
-        print(f"🔊 [AUDIO DEBUG] Session data keys: {list(session_data.keys())}")
-
-        if webrtc_manager:
-            track_exists = session_id in webrtc_manager.tracks
-            pc_exists = session_id in webrtc_manager.pcs
-            print(f"🔊 [AUDIO DEBUG] WebRTC track exists: {track_exists}")
-            print(f"🔊 [AUDIO DEBUG] WebRTC PC exists: {pc_exists}")
-            if pc_exists:
-                pc = webrtc_manager.pcs[session_id]
-                print(f"🔊 [AUDIO DEBUG] WebRTC connection state: {pc.connectionState}")
-
-        streaming_handler = StreamingHandler(
-            session_id=session_id,
-            tts_provider=tts_provider,
-            agent=agent
-        )
-        try:
-            await session_manager.stream_tts_response(session_id, response, streaming_handler)
-            print(f"✅ [AUDIO DEBUG] TTS streaming completed for session {session_id[:8]}...")
-        except Exception as tts_error:
-            print(f"❌ [AUDIO DEBUG] TTS streaming failed: {tts_error}")
-            import traceback
-            traceback.print_exc()
-
-    except asyncio.CancelledError:
-        # Task was cancelled because a new chunk arrived
-        logger.debug(f"Processing task cancelled for {session_id[:8]}... (new chunk arrived)")
-    except Exception as e:
-        logger.error(f"❌ Error processing audio buffer: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-async def handle_interruption(session_id: str, data: dict):
-    """Handle user interruption."""
-    logger.warning(f"🛑 User interrupted session {session_id[:8]}...")
-    # Agent can reset context or handle interruption
-    agent.handle_interruption(session_id)
 
 
 async def fetch_ice_servers(session_id: str) -> list:
@@ -475,19 +145,15 @@ async def fetch_ice_servers(session_id: str) -> list:
     import aiohttp
 
     ice_servers = [
-        # Google STUN servers (free, for NAT traversal discovery)
         {"urls": "stun:stun.l.google.com:19302"},
         {"urls": "stun:stun1.l.google.com:19302"},
     ]
 
-    # Add TURN servers for production (required when behind NAT/firewall)
     metered_api_key = os.environ.get("METERED_API_KEY")
     metered_url = os.environ.get("METERED_URL")
 
     if metered_api_key and metered_url:
-        # Fetch temporary TURN credentials from Metered.ca API
         try:
-            print(f"🔧 [ICE] Fetching TURN credentials from Metered.ca...")
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     f"{metered_url}?apiKey={metered_api_key}",
@@ -496,100 +162,556 @@ async def fetch_ice_servers(session_id: str) -> list:
                     if response.status == 200:
                         turn_servers = await response.json()
                         ice_servers.extend(turn_servers)
-                        print(f"🔧 [ICE] Got {len(turn_servers)} TURN servers from Metered.ca")
+                        logger.info(f"🔧 Got {len(turn_servers)} TURN servers from Metered.ca")
                     else:
-                        print(f"⚠️ [ICE] Metered.ca API error: {response.status}")
-                        # Fall back to OpenRelay
                         ice_servers.extend(_get_openrelay_servers())
         except Exception as e:
-            print(f"⚠️ [ICE] Failed to fetch Metered.ca credentials: {e}")
-            # Fall back to OpenRelay
+            logger.warning(f"⚠️ Failed to fetch TURN credentials: {e}")
             ice_servers.extend(_get_openrelay_servers())
     else:
-        # Use OpenRelay free TURN servers as fallback
         ice_servers.extend(_get_openrelay_servers())
 
-    print(f"🔧 [ICE] Configured {len(ice_servers)} ICE servers for session {session_id[:8]}...")
     return ice_servers
 
 
 def _get_openrelay_servers() -> list:
     """Get OpenRelay free TURN servers as fallback."""
-    print(f"🔧 [ICE] Using OpenRelay free TURN servers (fallback)")
     return [
-        {
-            "urls": "turn:openrelay.metered.ca:80",
-            "username": "openrelayproject",
-            "credential": "openrelayproject"
-        },
-        {
-            "urls": "turn:openrelay.metered.ca:443",
-            "username": "openrelayproject",
-            "credential": "openrelayproject"
-        },
-        {
-            "urls": "turn:openrelay.metered.ca:443?transport=tcp",
-            "username": "openrelayproject",
-            "credential": "openrelayproject"
-        }
+        {"urls": "turn:openrelay.metered.ca:80", "username": "openrelayproject", "credential": "openrelayproject"},
+        {"urls": "turn:openrelay.metered.ca:443", "username": "openrelayproject", "credential": "openrelayproject"},
+        {"urls": "turn:openrelay.metered.ca:443?transport=tcp", "username": "openrelayproject", "credential": "openrelayproject"}
     ]
 
 
-# ====== HTTP ENDPOINTS ======
+# ============================================================================
+# LIFESPAN (STARTUP/SHUTDOWN)
+# ============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize and cleanup global resources."""
+    global llm_provider, asr_provider, tts_provider, audio_validator
+    global webrtc_manager, sentence_aggregator, audio_converter
+    global asr_scheduler, asr_scheduler_task
+
+    # Set custom exception handler
+    loop = asyncio.get_event_loop()
+    loop.set_exception_handler(_custom_exception_handler)
+
+    logger.info("🚀 Starting Voice Agent Demo Server (v2 - Pipeline)...")
+    logger.info(f"📍 Environment: {os.environ.get('ENVIRONMENT', 'development')}")
+
+    # Check FFmpeg
+    if not check_ffmpeg_availability():
+        logger.warning("⚠️  Audio output may not work without FFmpeg!")
+
+    # Initialize LLM provider (OpenAI-compatible: ZhipuAI)
+    zhipuai_api_key = os.environ.get("ZHIPUAI_API_KEY")
+    if zhipuai_api_key:
+        llm_provider = OpenAICompatibleLLM(
+            config=LLMConfig(
+                model="glm-4-flash",
+                system_prompt=SYSTEM_PROMPT,
+                temperature=0.7,
+                max_tokens=1024,
+            ),
+            api_key=zhipuai_api_key,
+            base_url="https://open.bigmodel.cn/api/paas/v4/"
+        )
+        logger.info("✅ LLM provider initialized (ZhipuAI GLM-4-flash)")
+    else:
+        logger.error("❌ ZHIPUAI_API_KEY not set! LLM will not work.")
+
+    # Initialize ASR provider
+    asr_provider = HFSpaceASR(space_name="hz6666/SenseVoiceSmall")
+    logger.info("✅ ASR provider initialized (HF Space - SenseVoiceSmall)")
+
+    # Initialize TTS provider
+    tts_provider = get_tts_provider("edge-tts", TTSConfig(
+        voice="zh-CN-XiaoxiaoNeural",
+        rate="+0%"
+    ))
+    logger.info("✅ TTS provider initialized (Edge TTS)")
+
+    # Initialize audio validator
+    audio_validator = AudioValidator(
+        energy_threshold=MIN_AUDIO_ENERGY,
+        vad_mode=3,
+        enable_webrtc_vad=True,
+        speech_ratio_threshold=MIN_SPEECH_RATIO
+    )
+    logger.info("✅ Audio validator initialized")
+
+    # Initialize WebRTC manager
+    webrtc_manager = WebRTCManager()
+    logger.info("✅ WebRTC manager initialized")
+
+    # Initialize sentence aggregator (for streaming LLM → TTS)
+    sentence_aggregator = SentenceAggregator(AggregatorConfig(
+        min_chars=15,
+        max_wait_chars=200,
+    ))
+    logger.info("✅ Sentence aggregator initialized")
+
+    # Initialize audio converter
+    audio_converter = get_converter()
+    logger.info(f"✅ Audio converter initialized (FFmpeg available: {audio_converter.is_available()})")
+
+    # Initialize ASR scheduler
+    voice_sample_path = Path(__file__).parent / "scheduler" / "voice_sample" / "test_analysis_aapl_deeper.wav"
+    if voice_sample_path.exists():
+        asr_scheduler = DailyASRScheduler(
+            audio_path=str(voice_sample_path),
+            run_time=dt_time(hour=9, minute=0)
+        )
+        asr_scheduler_task = asyncio.create_task(asr_scheduler.start())
+        logger.info("✅ Daily ASR scheduler started")
+
+    logger.info("🎉 Server ready! Connect on ws://localhost:8000/ws")
+
+    yield
+
+    # Cleanup
+    logger.info("🛑 Shutting down server...")
+
+    # Cancel all active tasks
+    for session_id, task in list(active_tasks.items()):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    # Stop scheduler
+    if asr_scheduler:
+        asr_scheduler.stop()
+    if asr_scheduler_task:
+        asr_scheduler_task.cancel()
+
+    # Close WebRTC connections
+    if webrtc_manager:
+        for session_id in list(webrtc_manager.pcs.keys()):
+            await webrtc_manager.close_peer_connection(session_id)
+
+    logger.info("✅ Server shutdown complete")
+
+
+# ============================================================================
+# FASTAPI APP
+# ============================================================================
+
+app = FastAPI(
+    title="Voice Agent Demo (v2)",
+    description="Voice streaming with StreamingVoicePipeline",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================================
+# SESSION MANAGEMENT
+# ============================================================================
+
+async def create_session(websocket: WebSocket, user_id: str) -> str:
+    """Create a new voice session."""
+    session_id = str(uuid.uuid4())
+
+    sessions[session_id] = {
+        "user_id": user_id,
+        "websocket": websocket,
+        "is_active": True,
+        "is_speaking": False,
+        "created_at": time.time(),
+    }
+
+    audio_buffers[session_id] = {
+        "chunks": [],
+        "last_chunk_time": time.time(),
+        "processing_task": None,
+    }
+
+    # Initialize LLM session
+    if llm_provider:
+        llm_provider.create_session(session_id)
+
+    logger.info(f"📞 Session created: {session_id[:8]}...")
+    return session_id
+
+
+async def cleanup_session(session_id: str):
+    """Clean up a voice session."""
+    # Cancel active task
+    if session_id in active_tasks:
+        active_tasks[session_id].cancel()
+        del active_tasks[session_id]
+
+    # Clean up audio buffer
+    if session_id in audio_buffers:
+        buffer = audio_buffers[session_id]
+        if buffer.get("processing_task"):
+            buffer["processing_task"].cancel()
+        del audio_buffers[session_id]
+
+    # Clean up LLM session
+    if llm_provider:
+        llm_provider.cleanup_session(session_id)
+
+    # Clean up WebRTC
+    if webrtc_manager and session_id in webrtc_manager.pcs:
+        await webrtc_manager.close_peer_connection(session_id)
+
+    # Remove session
+    sessions.pop(session_id, None)
+
+    logger.info(f"👋 Session cleaned up: {session_id[:8]}...")
+
+
+async def send_message(session_id: str, message: dict):
+    """Send a message to a session."""
+    session = sessions.get(session_id)
+    if session and session.get("websocket"):
+        try:
+            await session["websocket"].send_text(json.dumps(message))
+        except Exception as e:
+            logger.error(f"Failed to send message: {e}")
+
+
+# ============================================================================
+# AUDIO PROCESSING (NEW PIPELINE)
+# ============================================================================
+
+async def process_audio(session_id: str, audio_bytes: bytes):
+    """
+    Process audio through the pipeline: ASR → LLM (streaming) → TTS → WebRTC
+
+    This uses:
+    - SentenceAggregator for streaming LLM tokens into sentences
+    - FFmpeg for MP3 → PCM conversion
+    - WebRTC for low-latency audio delivery
+    """
+    try:
+        # 1. Validate audio
+        is_valid, info = audio_validator.validate_audio(
+            audio_bytes, sample_rate=16000, format="webm"
+        )
+        if not is_valid:
+            logger.info(f"🔇 Audio validation failed: {info.get('reason')}")
+            return
+
+        logger.info(f"✅ Audio validated (energy={info.get('energy', 0):.1f})")
+
+        # 2. ASR: Audio → Text
+        logger.info(f"🎤 Transcribing audio ({len(audio_bytes)} bytes)...")
+        transcript = await asr_provider.transcribe(audio_bytes)
+
+        if not transcript or len(transcript.strip()) < 2:
+            logger.info("🔇 Empty transcript, ignoring")
+            await send_message(session_id, {
+                "event": "no_speech_detected",
+                "data": {"message": "No speech detected"}
+            })
+            return
+
+        logger.info(f"📝 Transcript: {transcript}")
+
+        # Send transcript to frontend
+        await send_message(session_id, {
+            "event": "transcript",
+            "data": {"text": transcript, "session_id": session_id}
+        })
+
+        # 3. LLM (streaming) → Sentence Aggregator → TTS → WebRTC
+        await stream_response(session_id, transcript)
+
+    except asyncio.CancelledError:
+        logger.info(f"Processing cancelled for {session_id[:8]}")
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error processing audio: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+async def stream_response(session_id: str, user_message: str):
+    """
+    Stream LLM response through TTS to WebRTC.
+
+    Key: Uses SentenceAggregator to start TTS before LLM finishes!
+    """
+    if not llm_provider:
+        logger.error("LLM provider not initialized")
+        return
+
+    session = sessions.get(session_id)
+    if not session:
+        return
+
+    session["is_speaking"] = True
+    full_response = ""
+
+    try:
+        logger.info(f"🤖 Streaming LLM response for: {user_message[:50]}...")
+
+        # Stream LLM tokens → aggregate into sentences → TTS each sentence
+        sentence_aggregator.reset()
+
+        async for token in llm_provider.stream(session_id, user_message):
+            # Check for interruption
+            if not session.get("is_speaking", True):
+                logger.info("🛑 Response interrupted")
+                break
+
+            # Aggregate tokens into sentences
+            sentences = sentence_aggregator.add_token(token)
+
+            # TTS and stream each complete sentence immediately
+            for sentence in sentences:
+                full_response += sentence + " "
+                logger.info(f"📢 Sentence ready: {sentence[:50]}...")
+
+                # Send sentence event to frontend
+                await send_message(session_id, {
+                    "event": "llm_sentence",
+                    "data": {"text": sentence}
+                })
+
+                # Stream TTS audio for this sentence
+                await stream_tts_to_webrtc(session_id, sentence)
+
+        # Flush remaining text
+        remaining = sentence_aggregator.flush()
+        if remaining and session.get("is_speaking", True):
+            full_response += remaining
+            logger.info(f"📢 Final chunk: {remaining[:50]}...")
+            await send_message(session_id, {
+                "event": "llm_sentence",
+                "data": {"text": remaining}
+            })
+            await stream_tts_to_webrtc(session_id, remaining)
+
+        # Send complete response
+        full_response = full_response.strip()
+        await send_message(session_id, {
+            "event": "agent_response",
+            "data": {"text": full_response, "session_id": session_id}
+        })
+
+        # Send streaming_complete to signal frontend to restart VAD
+        await send_message(session_id, {
+            "event": "streaming_complete",
+            "data": {"session_id": session_id}
+        })
+
+        logger.info(f"✅ Response complete: {len(full_response)} chars")
+
+    except asyncio.CancelledError:
+        logger.info(f"Response cancelled for {session_id[:8]}")
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error streaming response: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        session["is_speaking"] = False
+
+
+async def stream_tts_to_webrtc(session_id: str, text: str):
+    """
+    Convert text to speech and stream to WebRTC.
+
+    Uses FFmpeg for MP3 → PCM conversion (48kHz for Opus).
+    """
+    if session_id not in webrtc_manager.tracks:
+        logger.warning(f"No WebRTC track for {session_id[:8]}")
+        return
+
+    session = sessions.get(session_id)
+    if not session or not session.get("is_speaking", True):
+        return
+
+    try:
+        # Get TTS audio stream (MP3 chunks)
+        tts_stream = tts_provider.stream_audio(text)
+
+        # Convert MP3 → PCM using FFmpeg and push to WebRTC
+        async for pcm_chunk in audio_converter.mp3_to_pcm_stream(tts_stream):
+            # Check for interruption
+            if not session.get("is_speaking", True):
+                break
+
+            # Push PCM to WebRTC track
+            await webrtc_manager.push_audio_chunk(session_id, pcm_chunk)
+
+    except Exception as e:
+        logger.error(f"❌ TTS streaming error: {e}")
+
+
+# ============================================================================
+# INTERRUPTION HANDLING
+# ============================================================================
+
+async def handle_interrupt(session_id: str):
+    """Handle user interruption - stop current response immediately."""
+    logger.warning(f"🛑 Interrupt received for {session_id[:8]}...")
+
+    session = sessions.get(session_id)
+    if session:
+        session["is_speaking"] = False
+
+    # Cancel active processing task
+    if session_id in active_tasks:
+        active_tasks[session_id].cancel()
+        del active_tasks[session_id]
+
+    # Flush WebRTC track
+    if webrtc_manager and session_id in webrtc_manager.tracks:
+        try:
+            await webrtc_manager.tracks[session_id].flush()
+            await webrtc_manager.replace_audio_track(session_id)
+            logger.info(f"🧹 Flushed WebRTC track for {session_id[:8]}")
+        except Exception as e:
+            logger.error(f"Error flushing track: {e}")
+
+    # Notify frontend
+    await send_message(session_id, {
+        "event": "voice_interrupted",
+        "data": {"session_id": session_id, "action": "flush_audio"}
+    })
+
+
+# ============================================================================
+# WEBSOCKET MESSAGE HANDLING
+# ============================================================================
+
+async def handle_audio_chunk(session_id: str, data: dict):
+    """Handle incoming audio chunk with buffering."""
+    audio_data = data.get("audio")
+    if not audio_data:
+        return
+
+    audio_bytes = base64.b64decode(audio_data)
+
+    if session_id not in audio_buffers:
+        return
+
+    buffer = audio_buffers[session_id]
+    buffer["chunks"].append(audio_bytes)
+    buffer["last_chunk_time"] = time.time()
+
+    logger.debug(f"🎤 Buffered chunk ({len(audio_bytes)} bytes), total: {len(buffer['chunks'])}")
+
+    # Cancel existing processing task
+    if buffer["processing_task"] and not buffer["processing_task"].done():
+        buffer["processing_task"].cancel()
+
+    # Schedule processing after timeout
+    buffer["processing_task"] = asyncio.create_task(
+        _process_buffer_after_timeout(session_id)
+    )
+
+
+async def _process_buffer_after_timeout(session_id: str):
+    """Process audio buffer after timeout."""
+    try:
+        await asyncio.sleep(BUFFER_TIMEOUT)
+
+        if session_id not in audio_buffers:
+            return
+
+        buffer = audio_buffers[session_id]
+        chunks = buffer["chunks"]
+
+        if not chunks:
+            return
+
+        logger.info(f"🎙️ Processing {len(chunks)} audio chunks...")
+
+        # Combine chunks
+        combined_audio = b''.join(chunks)
+        buffer["chunks"] = []
+
+        # Process through pipeline
+        task = asyncio.create_task(process_audio(session_id, combined_audio))
+        active_tasks[session_id] = task
+        await task
+
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.error(f"❌ Error processing buffer: {e}")
+
+
+async def handle_webrtc_offer(session_id: str, data: dict):
+    """Handle WebRTC SDP offer."""
+    offer_data = data.get("offer", data)
+    sdp = offer_data.get("sdp")
+    type_ = offer_data.get("type")
+
+    if not sdp:
+        logger.error("No SDP in offer")
+        return
+
+    # Get ICE servers
+    ice_servers = await fetch_ice_servers(session_id)
+
+    # Create answer
+    answer = await webrtc_manager.handle_offer(session_id, sdp, type_, ice_servers=ice_servers)
+
+    if answer:
+        await send_message(session_id, {
+            "event": "webrtc_answer",
+            "data": {"sdp": answer["sdp"], "type": answer["type"], "session_id": session_id}
+        })
+        logger.info(f"✅ Sent WebRTC answer for {session_id[:8]}")
+
+
+async def handle_webrtc_ice_candidate(session_id: str, data: dict):
+    """Handle WebRTC ICE candidate."""
+    candidate = data.get("candidate")
+    if candidate:
+        await webrtc_manager.handle_ice_candidate(session_id, data)
+
+
+# ============================================================================
+# HTTP ENDPOINTS
+# ============================================================================
 
 @app.get("/")
 async def root():
-    """Health check endpoint."""
     return {
-        "service": "Voice Agent Demo",
+        "service": "Voice Agent Demo (v2)",
         "status": "running",
-        "version": "1.0.0",
-        "endpoints": {
-            "websocket": "/ws",
-            "health": "/health"
-        }
+        "version": "2.0.0",
+        "pipeline": "StreamingVoicePipeline"
     }
 
 
 @app.get("/health")
 async def health():
-    """Detailed health status."""
     return {
         "status": "healthy",
-        "active_sessions": session_manager.get_active_connections_count() if session_manager else 0,
+        "active_sessions": len(sessions),
         "components": {
+            "llm": llm_provider is not None,
+            "asr": asr_provider is not None,
             "tts": tts_provider is not None,
-            "asr": asr_processor is not None,
             "webrtc": webrtc_manager is not None,
-            "agent": agent is not None
+            "ffmpeg": audio_converter.is_available() if audio_converter else False,
         }
     }
 
 
 @app.get("/debug/audio")
 async def debug_audio():
-    """Debug endpoint to check audio pipeline status."""
-    import shutil
-    import subprocess
-
-    # Check FFmpeg
-    ffmpeg_path = shutil.which("ffmpeg")
-    ffmpeg_version = None
-    ffmpeg_error = None
-
-    if ffmpeg_path:
-        try:
-            result = subprocess.run(
-                ["ffmpeg", "-version"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            ffmpeg_version = result.stdout.split('\n')[0] if result.stdout else "unknown"
-        except Exception as e:
-            ffmpeg_error = str(e)
-
-    # Check WebRTC state
+    """Debug endpoint for audio pipeline."""
     webrtc_info = {}
     if webrtc_manager:
         webrtc_info = {
@@ -601,66 +723,76 @@ async def debug_audio():
             }
         }
 
-    # Check active sessions with WebRTC status
-    sessions_info = {}
-    if session_manager:
-        for sid, data in session_manager.session_data.items():
-            sessions_info[sid[:8]] = {
-                "webrtc_enabled": data.get("webrtc_enabled", False),
-                "is_active": data.get("is_active", False)
-            }
-
     return {
         "ffmpeg": {
-            "available": ffmpeg_path is not None,
-            "path": ffmpeg_path,
-            "version": ffmpeg_version,
-            "error": ffmpeg_error
-        },
-        "environment": {
-            "ENVIRONMENT": os.environ.get("ENVIRONMENT", "not set"),
-            "PATH": os.environ.get("PATH", "not set")[:200] + "..."  # Truncate PATH
+            "available": audio_converter.is_available() if audio_converter else False,
+            "version": audio_converter.get_version() if audio_converter else None,
         },
         "webrtc": webrtc_info,
-        "sessions": sessions_info,
-        "tts_provider": type(tts_provider).__name__ if tts_provider else None
+        "sessions": {sid[:8]: {"is_speaking": s.get("is_speaking")} for sid, s in sessions.items()},
     }
+
+
+# ============================================================================
+# WEBSOCKET ENDPOINT
+# ============================================================================
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for voice streaming."""
     session_id = None
-    try:
-        # Extract user ID from query params (or use anonymous)
-        user_id = websocket.query_params.get("user_id", "anonymous")
 
-        # Accept WebSocket connection
+    try:
+        user_id = websocket.query_params.get("user_id", "anonymous")
         await websocket.accept()
-        logger.info(f"📞 WebSocket connection accepted")
+        logger.info("📞 WebSocket connection accepted")
 
         # Create session
-        session_id = await session_manager.connect(
-            websocket=websocket,
-            user_id=user_id,
-            session_metadata={
-                "client_ip": websocket.client.host if websocket.client else "unknown"
-            }
-        )
+        session_id = await create_session(websocket, user_id)
 
-        # Listen for messages
+        # Fetch ICE servers and send welcome
+        # NOTE: Frontend expects "connected" event (not "session_started")
+        ice_servers = await fetch_ice_servers(session_id)
+        await send_message(session_id, {
+            "event": "connected",
+            "data": {
+                "session_id": session_id,
+                "message": "Connected to Voice Session",
+                "ice_servers": ice_servers,
+            }
+        })
+
+        # Message loop
         while True:
             message = await websocket.receive_text()
-            await session_manager.process_message(websocket, message)
+            data = json.loads(message)
+            event = data.get("event")
+
+            if event == "audio_chunk":
+                await handle_audio_chunk(session_id, data.get("data", data))
+            elif event == "interrupt":
+                await handle_interrupt(session_id)
+            elif event == "webrtc_offer":
+                await handle_webrtc_offer(session_id, data.get("data", data))
+            elif event == "webrtc_ice_candidate":
+                await handle_webrtc_ice_candidate(session_id, data.get("data", data))
+            elif event == "heartbeat":
+                pass
+            else:
+                logger.warning(f"Unknown event: {event}")
 
     except WebSocketDisconnect:
-        logger.info(f"🔌 WebSocket disconnected")
-        if session_id:
-            await session_manager.disconnect(session_id)
+        logger.info("🔌 WebSocket disconnected")
     except Exception as e:
         logger.error(f"❌ WebSocket error: {e}")
+    finally:
         if session_id:
-            await session_manager.disconnect(session_id)
+            await cleanup_session(session_id)
 
+
+# ============================================================================
+# MAIN
+# ============================================================================
 
 if __name__ == "__main__":
     import uvicorn
